@@ -11,7 +11,30 @@ from rich.text import Text
 from rich.logging import RichHandler
 import functools
 import inspect
+import argparse
 
+
+def parse_debug_args():
+    debug_parser = argparse.ArgumentParser(add_help=False)
+    debug_parser.add_argument("--debug", action="store_true")
+    debug_parser.add_argument("--verbose", action="store_true")
+    args, _ = debug_parser.parse_known_args()
+    return args
+
+def setup_debug_logging():
+    debug_args = parse_debug_args()
+    root_logger = logging.getLogger("root")
+    
+    if debug_args.verbose:
+        nxc_logger.logger.setLevel(logging.INFO)
+        root_logger.setLevel(logging.INFO)
+    elif debug_args.debug:
+        nxc_logger.logger.setLevel(logging.DEBUG)
+        root_logger.setLevel(logging.INFO)
+    else:
+        nxc_logger.logger.setLevel(logging.ERROR)
+        root_logger.setLevel(logging.ERROR)
+        
 
 def create_temp_logger(caller_frame, formatted_text, args, kwargs):
     """Create a temporary logger for emitting a log where we need to override the calling file & line number, since these are obfuscated"""
@@ -30,12 +53,14 @@ class SmartDebugRichHandler(RichHandler):
             
     def emit(self, record):
         """Overrides the emit method of the RichHandler class so we can set the proper pathname and lineno"""
+        # for some reason in RDP, the exc_text is None which leads to a KeyError in Python logging
+        record.exc_text = record.getMessage() if record.exc_text is None else record.exc_text
+        
         if hasattr(record, "caller_frame"):
             frame_info = inspect.getframeinfo(record.caller_frame)
             record.pathname = frame_info.filename
             record.lineno = frame_info.lineno
         super().emit(record)
-
 
 def no_debug(func):
     """Stops logging non-debug messages when we are in debug mode
@@ -68,10 +93,13 @@ class NXCAdapter(logging.LoggerAdapter):
         self.logger = logging.getLogger("nxc")
         self.extra = extra
         self.output_file = None
-
+        
+        logging.getLogger("impacket").disabled = True
         logging.getLogger("pypykatz").disabled = True
         logging.getLogger("minidump").disabled = True
         logging.getLogger("lsassy").disabled = True
+        logging.getLogger("dploot").disabled = True
+        logging.getLogger("neo4j").setLevel(logging.ERROR)
 
     def format(self, msg, *args, **kwargs):  # noqa: A003
         """Format msg for output
