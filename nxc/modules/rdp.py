@@ -1,6 +1,7 @@
 from sys import exit
 
-from nxc.connection import dcom_FirewallChecker
+from nxc.helpers.rpc import dcom_FirewallChecker
+from nxc.helpers.misc import CATEGORY
 
 from impacket.dcerpc.v5 import rrp
 from impacket.examples.secretsdump import RemoteOperations
@@ -15,8 +16,7 @@ class NXCModule:
     name = "rdp"
     description = "Enables/Disables RDP"
     supported_protocols = ["smb", "wmi"]
-    opsec_safe = True
-    multiple_hosts = True
+    category = CATEGORY.PRIVILEGE_ESCALATION
 
     def __init__(self, context=None, module_options=None):
         self.context = context
@@ -83,7 +83,7 @@ class NXCModule:
 
             wmi_rdp = RdpWmi(context, connection, self.dcom_timeout)
 
-            if hasattr(wmi_rdp, "_rdp_WMI__iWbemLevel1Login"):
+            if hasattr(wmi_rdp, "_RdpWmi__iWbemLevel1Login"):
                 if "ram" in self.action:
                     # Nt version under 6 not support RAM.
                     try:
@@ -101,7 +101,8 @@ class NXCModule:
                             context.log.fail("Looks like target system version is under NT6, please add 'OLD=true' in module options.")
                         else:
                             context.log.fail(str(e))
-                wmi_rdp._rdp_WMI__dcom.disconnect()
+                if wmi_rdp._RdpWmi__dcom is not None:
+                    wmi_rdp._RdpWmi__dcom.disconnect()
 
 
 class RdpSmb:
@@ -218,10 +219,20 @@ class RdpWmi:
         self.__target = connection.host if not connection.kerberos else connection.hostname + "." + connection.domain
         self.__doKerberos = connection.kerberos
         self.__kdcHost = connection.kdcHost
+        self.__remoteHost = connection.host
         self.__aesKey = connection.aesKey
         self.__timeout = timeout
 
+        self.__dcom = None
+        if self.__currentprotocol == "wmi":
+            # The wmi protocol already holds an authenticated IWbemLevel1Login:
+            # reuse it instead of creating a second DCOMConnection to the same
+            # target (whose disconnect would clash with the protocol's own)
+            self.__iWbemLevel1Login = connection.iWbemLevel1Login
+            return
+
         try:
+            *_, tgt, _ = connection.conn.getCredentials()
             self.__dcom = DCOMConnection(
                 self.__target,
                 self.__username,
@@ -233,11 +244,13 @@ class RdpWmi:
                 oxidResolver=True,
                 doKerberos=self.__doKerberos,
                 kdcHost=self.__kdcHost,
+                remoteHost=self.__remoteHost,
+                TGT=tgt,
             )
 
             i_interface = self.__dcom.CoCreateInstanceEx(wmi.CLSID_WbemLevel1Login, wmi.IID_IWbemLevel1Login)
             if self.__currentprotocol == "smb":
-                flag, self.__stringBinding = dcom_FirewallChecker(i_interface, self.__timeout)
+                flag, self.__stringBinding = dcom_FirewallChecker(i_interface, self.__remoteHost, self.__timeout, self.logger)
                 if not flag or not self.__stringBinding:
                     error_msg = f'RDP-WMI: Dcom initialization failed on connection with stringbinding: "{self.__stringBinding}", please increase the timeout with the module option "DCOM-TIMEOUT=10". If it\'s still failing maybe something is blocking the RPC connection, please try to use "-o" with "METHOD=smb"'
 

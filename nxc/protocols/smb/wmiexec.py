@@ -1,15 +1,17 @@
 import ntpath
 import os
 from time import sleep
-from nxc.connection import dcom_FirewallChecker
+from nxc.helpers.rpc import dcom_FirewallChecker
 from nxc.helpers.misc import gen_random_string
+from nxc.paths import TMP_PATH
+from nxc.protocols.smb.exec_output import get_output_file
 from impacket.dcerpc.v5.dcomrt import DCOMConnection
 from impacket.dcerpc.v5.dcom import wmi
 from impacket.dcerpc.v5.dtypes import NULL
 
 
 class WMIEXEC:
-    def __init__(self, target, share_name, username, password, domain, smbconnection, doKerberos=False, aesKey=None, kdcHost=None, hashes=None, share=None, logger=None, timeout=None, tries=None):
+    def __init__(self, target, share_name, username, password, domain, smbconnection, doKerberos=False, aesKey=None, kdcHost=None, remoteHost=None, hashes=None, share=None, logger=None, timeout=None, tries=None):
         self.__target = target
         self.__username = username
         self.__password = password
@@ -26,6 +28,7 @@ class WMIEXEC:
         self.__pwd = "C:\\"
         self.__aesKey = aesKey
         self.__kdcHost = kdcHost
+        self.__remoteHost = remoteHost
         self.__doKerberos = doKerberos
         self.__retOutput = True
         self.__stringBinding = ""
@@ -41,6 +44,7 @@ class WMIEXEC:
 
         if self.__password is None:
             self.__password = ""
+        *_, tgt, _ = smbconnection.getCredentials()
         self.__dcom = DCOMConnection(
             self.__target,
             self.__username,
@@ -52,9 +56,11 @@ class WMIEXEC:
             oxidResolver=True,
             doKerberos=self.__doKerberos,
             kdcHost=self.__kdcHost,
+            remoteHost=self.__remoteHost,
+            TGT=tgt,
         )
         iInterface = self.__dcom.CoCreateInstanceEx(wmi.CLSID_WbemLevel1Login, wmi.IID_IWbemLevel1Login)
-        flag, self.__stringBinding = dcom_FirewallChecker(iInterface, self.__timeout)
+        flag, self.__stringBinding = dcom_FirewallChecker(iInterface, self.__remoteHost, self.__timeout, self.logger)
         if not flag or not self.__stringBinding:
             error_msg = f'WMIEXEC: Dcom initialization failed on connection with stringbinding: "{self.__stringBinding}", please increase the timeout with the option "--dcom-timeout". If it\'s still failing maybe something is blocking the RPC connection, try another exec method'
 
@@ -108,7 +114,7 @@ class WMIEXEC:
 
         command = self.__shell + data
         if self.__retOutput:
-            command += " 1> " + f"{self.__output}" + " 2>&1"
+            command += f" 1> {self.__output} 2>&1"
 
         self.logger.debug("Executing command: " + command)
         self.__win32Process.Create(command, self.__pwd, None)
@@ -127,7 +133,7 @@ class WMIEXEC:
     def get_output_fileless(self):
         while True:
             try:
-                with open(os.path.join("/tmp", "nxc_hosted", self.__output)) as output:
+                with open(os.path.join(TMP_PATH, self.__output)) as output:
                     self.output_callback(output.read())
                 break
             except OSError:
@@ -138,25 +144,4 @@ class WMIEXEC:
             self.__outputBuffer = ""
             return
 
-        tries = 1
-        while True:
-            try:
-                self.logger.info(f"Attempting to read {self.__share}\\{self.__output}")
-                self.__smbconnection.getFile(self.__share, self.__output, self.output_callback)
-                break
-            except Exception as e:
-                if tries >= self.__tries:
-                    self.logger.fail("WMIEXEC: Could not retrieve output file, it may have been detected by AV. If it is still failing, try the 'wmi' protocol or another exec method")
-                    break
-                if str(e).find("STATUS_BAD_NETWORK_NAME") > 0:
-                    self.logger.fail(f"SMB connection: target has blocked {self.__share} access (maybe command executed!)")
-                    break
-                if str(e).find("STATUS_SHARING_VIOLATION") >= 0 or str(e).find("STATUS_OBJECT_NAME_NOT_FOUND") >= 0:
-                    sleep(2)
-                    tries += 1
-                else:
-                    self.logger.debug(str(e))
-
-        if self.__outputBuffer:
-            self.logger.debug(f"Deleting file {self.__share}\\{self.__output}")
-            self.__smbconnection.deleteFile(self.__share, self.__output)
+        get_output_file(self.__smbconnection, self.__share, self.__output, self.output_callback, self.__tries, self.logger, "WMIEXEC")

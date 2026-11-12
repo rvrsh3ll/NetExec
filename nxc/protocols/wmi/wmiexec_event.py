@@ -1,4 +1,4 @@
-# Author: xiaolichan # noqa: ERA001
+# Author: xiaolichan  # ruff: ignore[commented-out-code]
 # Link: https://github.com/XiaoliChan/wmiexec-Pro
 # Note: windows version under NT6 not working with this command execution way, it need Win32_ScheduledJob.
 #       https://github.com/XiaoliChan/wmiexec-Pro/blob/main/lib/modules/exec_command.py
@@ -26,43 +26,33 @@ import sys
 from io import StringIO
 from nxc.helpers.powershell import get_ps_script
 from impacket.dcerpc.v5.dtypes import NULL
-from impacket.dcerpc.v5.dcomrt import DCOMConnection
-from impacket.dcerpc.v5.dcom.wmi import CLSID_WbemLevel1Login, IID_IWbemLevel1Login, IWbemLevel1Login, WBEMSTATUS
+from impacket.dcerpc.v5.dcom.wmi import WBEMSTATUS
 
 
 class WMIEXEC_EVENT:
-    def __init__(self, host, username, password, domain, lmhash, nthash, doKerberos, kdcHost, aesKey, logger, exec_timeout, codec):
-        self.__host = host
-        self.__username = username
-        self.__password = password
-        self.__domain = domain
-        self.__lmhash = lmhash
-        self.__nthash = nthash
-        self.__doKerberos = doKerberos
-        self.__kdcHost = kdcHost
-        self.__aesKey = aesKey
+    def __init__(self, target, iWbemLevel1Login, logger, exec_timeout, codec, subscription_namespace=None):
+        self.__target = target
+        self.__iWbemLevel1Login = iWbemLevel1Login
         self.__outputBuffer = ""
         self.__retOutput = True
-
         self.logger = logger
         self.__exec_timeout = exec_timeout
         self.__codec = codec
         self.__instanceID = f"windows-object-{uuid.uuid4()!s}"
         self.__instanceID_StoreResult = f"windows-object-{uuid.uuid4()!s}"
 
-        self.__dcom = DCOMConnection(self.__host, self.__username, self.__password, self.__domain, self.__lmhash, self.__nthash, oxidResolver=True, doKerberos=self.__doKerberos, kdcHost=self.__kdcHost, aesKey=self.__aesKey)
-        iInterface = self.__dcom.CoCreateInstanceEx(CLSID_WbemLevel1Login, IID_IWbemLevel1Login)
-        iWbemLevel1Login = IWbemLevel1Login(iInterface)
-        self.__iWbemServices = iWbemLevel1Login.NTLMLogin("//./root/subscription", NULL, NULL)
-        iWbemLevel1Login.RemRelease()
+        self.__iWbemServices = subscription_namespace
+        if self.__iWbemServices is None:
+            self.__iWbemServices = self.__iWbemLevel1Login.NTLMLogin("//./root/subscription", NULL, NULL)
+            self.__iWbemLevel1Login.RemRelease()
 
-    def execute(self, command, output=False):
+    def execute(self, command, output=False, use_powershell=False):
         if "'" in command:
             command = command.replace("'", r'"')
+        if use_powershell:
+            command = f"powershell.exe -Command {command}"
         self.__retOutput = output
         self.execute_handler(command)
-
-        self.__dcom.disconnect()
 
         return self.__outputBuffer
 
@@ -75,7 +65,7 @@ class WMIEXEC_EVENT:
 
     def execute_handler(self, command):
         # Generate vbsript and execute it
-        self.logger.debug(f"{self.__host}: Execute command via wmi event, job instance id: {self.__instanceID}, command result instance id: {self.__instanceID_StoreResult}")
+        self.logger.debug(f"{self.__target}: Execute command via wmi event, job instance id: {self.__instanceID}, command result instance id: {self.__instanceID_StoreResult}")
         self.execute_remote(command)
 
         # Get command results
